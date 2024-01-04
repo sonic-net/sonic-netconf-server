@@ -1,0 +1,12 @@
+
+package netconf_codegen
+
+var {{type}}Map = map[string][]string{
+    {{#paths}}
+    "{{key}}": {
+        {{#values}}
+            "{{value}}",
+        {{/values}}
+    },
+    {{/paths}}
+}
