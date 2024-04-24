@@ -1,3 +1,16 @@
+//
+// Software Name: sonic-netconf-server
+// SPDX-FileCopyrightText: Copyright (c) Orange SA
+// SPDX-License-Identifier: Apache 2.0
+//
+// This software is distributed under the Apache 2.0 licence,
+// the text of which is available at https://opensource.org/license/apache-2-0/
+// or see the "LICENSE" file for more details.
+//
+// Authors: hossam4.hassan@orange.com, abdelmuhaimen.seaudi@orange.com
+// Software description: RFC compliant NETCONF server implementation for SONiC
+//
+
 package server
 
 import (
@@ -22,6 +35,12 @@ const (
 	declaration = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
 )
 
+type SessionRequest struct{
+	xml string
+	authenticator Authenticator
+	session ssh.Session
+}
+
 func SessionHandler(s ssh.Session) {
 
 	scanner := bufio.NewScanner(s)
@@ -44,7 +63,12 @@ func SessionHandler(s ssh.Session) {
 	for scanner.Scan() {
 		requestStr := scanner.Text()
 		glog.Infof("\nReceving request <<< %s >>> \n %s \n\n", time.Now().Local().String(), requestStr)
-		response := process(s, requestStr)
+		request := SessionRequest{
+			xml : requestStr,
+			authenticator: s.Context().Value("auth").(Authenticator),
+			session: s,
+		}
+		response := process(request)
 		glog.Infof("\nSending response <<< %s >>> \n %s \n\n", time.Now().Local().String(), response)
 		writeResponse(s, response)
 	}
@@ -83,6 +107,8 @@ func capabilitesXML() []byte {
 
 func readCapabilities(clientCaps string) error {
 
+	// TODO: Handle client caps
+
 	mainNode, err := xmlquery.Parse(strings.NewReader(clientCaps))
 
 	if err != nil {
@@ -99,29 +125,29 @@ func readCapabilities(clientCaps string) error {
 	return nil
 }
 
-func process(session ssh.Session, requestStr string) string {
+func process(request SessionRequest) string {
 
-	defer doRecover(session, requestStr)
+	defer doRecover(request.session, request.xml)
 
-	rpcNode, err := xmlquery.Parse(strings.NewReader(requestStr))
+	rpcNode, err := xmlquery.Parse(strings.NewReader(request.xml))
 
 	if err != nil {
-		return createErrorResponse(extractMessageId(requestStr), errors.New("[Malformed XML] Unable to parser request string"))
+		return createErrorResponse(extractMessageId(request.xml), errors.New("[Malformed XML] Unable to parser request string"))
 	}
 
 	rootNode := xmlquery.FindOne(rpcNode, "*")
 
 	if rootNode == nil {
-		return createErrorResponse(extractMessageId(requestStr), errors.New("[Malformed XML] Root node not found"))
+		return createErrorResponse(extractMessageId(request.xml), errors.New("[Malformed XML] Root node not found"))
 	}
 
 	messageId := rootNode.SelectAttr("message-id")
 
 	if messageId == "" {
-		return createErrorResponse(extractMessageId(requestStr), errors.New("[Missing data] Unable to read message-id in rpc"))
+		return createErrorResponse(extractMessageId(request.xml), errors.New("[Missing data] Unable to read message-id in rpc"))
 	}
 
-	response, err := handleRequest(session, rootNode)
+	response, err := handleRequest(request, rootNode)
 
 	if err != nil {
 		return createErrorResponse(messageId, err)
@@ -130,20 +156,20 @@ func process(session ssh.Session, requestStr string) string {
 	return CreateResponse(messageId, []byte(response))
 }
 
-func handleRequest(session ssh.Session, requestNode *xmlquery.Node) (string, error) {
+func handleRequest(request SessionRequest, rpcXML *xmlquery.Node) (string, error) {
 
 	var response string
 	var err error
 
-	typeNode := xmlquery.FindOne(requestNode, "//*[local-name() = 'rpc']/*") // Get request type 
+	typeNode := xmlquery.FindOne(rpcXML, "//*[local-name() = 'rpc']/*") // Get request type 
 
 	switch typeNode.Data {
 	case "get":
-		response, err = GetRequestHandler(session.Context().(ssh.Context), requestNode)
+		response, err = GetRequestHandler(request.authenticator, rpcXML)
 	case "get-schema":
-		response, err = GetSchemaHandler(requestNode)
+		response, err = GetSchemaHandler(rpcXML)
 	case "close-session":
-		time.AfterFunc(1* time.Second, func() {session.Close()}) // probably a better way to do this ?
+		time.AfterFunc(1* time.Second, func() {request.session.Close()}) // probably a better way to do this ?
 		return "ok", nil
 	default:
 		return "", errors.New("Unsupported command")
@@ -172,6 +198,7 @@ func CreateResponse(messageId string, responsePayload []byte) string {
 		reply = `<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="` + messageId + `">` + reply + "</rpc-reply>"
 		reply = strings.ReplaceAll(reply, "&amp;", "&")
 	}
+
 	return declaration + reply
 }
 

@@ -1,3 +1,16 @@
+//
+// Software Name: sonic-netconf-server
+// SPDX-FileCopyrightText: Copyright (c) Orange SA
+// SPDX-License-Identifier: Apache 2.0
+//
+// This software is distributed under the Apache 2.0 licence,
+// the text of which is available at https://opensource.org/license/apache-2-0/
+// or see the "LICENSE" file for more details.
+//
+// Authors: hossam4.hassan@orange.com, abdelmuhaimen.seaudi@orange.com
+// Software description: RFC compliant NETCONF server implementation for SONiC
+//
+
 package server
 
 import (
@@ -16,7 +29,6 @@ import (
 	"github.com/Azure/sonic-mgmt-common/translib"
 	"github.com/antchfx/xmlquery"
 	"github.com/clbanning/mxj/v2"
-	"github.com/gliderlabs/ssh"
 	"github.com/go-redis/redis/v7"
 	"github.com/golang/glog"
 )
@@ -93,9 +105,9 @@ func readYangModules() {
 	yangModulesInit = true
 }
 
-func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error) {
+func GetRequestHandler(authenticator Authenticator, rootNode *xmlquery.Node) (string, error) {
 
-	requests, err := ParseGetRequest(rootNode, false)
+	requests, err := ParseGetRequest(rootNode)
 
 	glog.Infof("Extracted requests %+v", requests)
 
@@ -103,7 +115,7 @@ func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, er
 		return "", err
 	}
 
-	authenticator := context.Value("auth").(Authenticator)
+	// authenticator := context.Value("auth").(Authenticator)
 
 	for _, request := range requests {
 		// Authorize
@@ -150,7 +162,7 @@ func innerGetHandler(rootNode *xmlquery.Node, request GetRequest) (string, error
 		}
 		return string(response), nil
 	case "/netconf-state:netconf-state/schemas":
-		requests, _ := ParseGetRequest(rootNode, true)
+		requests, _ := ParseGetRequest(rootNode)
 		return getSchemas(requests[0].path), nil
 	case "/operation:operation":
 		return "", nil
