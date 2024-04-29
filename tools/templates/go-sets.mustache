@@ -1,0 +1,7 @@
+package netconf_codegen
+
+var {{name}} = map[{{type}}]bool{
+    {{#values}}
+        "{{.}}":true,
+    {{/values}}
+}
