@@ -1,0 +1,16 @@
+
+.vscode
+*.code-workspace
+pkg/*
+build
+gopkgs
+__pycache__
+*.pyc
+*.rdb
+*.swp
+
+*.yin
+*.tree
+
+vendor
+models/yangs
