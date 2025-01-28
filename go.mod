@@ -16,7 +16,6 @@ require (
 	github.com/antchfx/jsonquery v1.1.4 // indirect
 	github.com/antchfx/xmlquery v1.3.1 // indirect
 	github.com/antchfx/xpath v1.1.10 // indirect
-	github.com/felixge/fgprof v0.9.3 // indirect
 	github.com/go-playground/locales v0.13.0 // indirect
 	github.com/go-playground/universal-translator v0.17.0 // indirect
 	github.com/go-redis/redis/v7 v7.0.0-beta.3.0.20190824101152-d19aba07b476 // indirect
