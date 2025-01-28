@@ -15,7 +15,6 @@ require (
 	github.com/Workiva/go-datastructures v1.0.50 // indirect
 	github.com/antchfx/jsonquery v1.1.4 // indirect
 	github.com/antchfx/xpath v1.1.10 // indirect
-	github.com/felixge/fgprof v0.9.3 // indirect
 	github.com/go-playground/locales v0.13.0 // indirect
 	github.com/go-playground/universal-translator v0.17.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
