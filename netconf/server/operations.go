@@ -21,7 +21,8 @@ const (
 	CapConfirmedCommit = "urn:ietf:params:netconf:capability:confirmed-commit:1.1"
 	CapValidate        = "urn:ietf:params:netconf:capability:validate:1.1"
 	CapWithDefaults    = "urn:ietf:params:netconf:capability:with-defaults:1.0"
-	CapNotifiction     = "urn:ietf:params:netconf:capability:notification:1.0"
+	CapNotification    = "urn:ietf:params:netconf:capability:notification:1.0"
+	CapNotifiction     = CapNotification
 	CapInterleave      = "urn:ietf:params:netconf:capability:interleave:1.0"
 	CapStartup         = "urn:ietf:params:netconf:capability:startup:1.0"
 	CapWritableRunning = "urn:ietf:params:netconf:capability:writable-running:1.0"

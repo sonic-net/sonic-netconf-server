@@ -21,13 +21,228 @@ type Config struct {
 }
 
 type GetRequest struct {
-	path 		string
-	filters 	[]string
+	path    string
+	filters []string
 }
 
 type RPCRequest struct {
 	path    string
 	payload map[string]interface{}
+}
+
+func ParseCreateSubscription(node *xmlquery.Node) (CreateSubscription, []string, error) {
+	sub := CreateSubscription{}
+
+	subNode := xmlquery.FindOne(node, "//*[local-name() = 'create-subscription']")
+	if subNode == nil {
+		return sub, nil, errors.New("missing create-subscription")
+	}
+	if subNode.NamespaceURI != "" && subNode.NamespaceURI != NsNetconfNotification {
+		return sub, nil, errors.New("invalid create-subscription namespace")
+	}
+
+	if streamNode := xmlquery.FindOne(subNode, "./*[local-name() = 'stream']/text()"); streamNode != nil {
+		sub.Stream = strings.TrimSpace(streamNode.Data)
+	}
+	if startNode := xmlquery.FindOne(subNode, "./*[local-name() = 'startTime']/text()"); startNode != nil {
+		sub.StartTime = strings.TrimSpace(startNode.Data)
+	}
+	if stopNode := xmlquery.FindOne(subNode, "./*[local-name() = 'stopTime']/text()"); stopNode != nil {
+		sub.StopTime = strings.TrimSpace(stopNode.Data)
+	}
+
+	filterNode := xmlquery.FindOne(subNode, "./*[local-name() = 'filter']")
+	if filterNode == nil {
+		return sub, nil, nil
+	}
+	sub.HasFilter = true
+
+	sub.Filter.Type = filterNode.SelectAttr("type")
+	sub.Filter.Select = filterNode.SelectAttr("select")
+	sub.Filter.Subtree = strings.TrimSpace(filterNode.OutputXML(false))
+
+	paths, err := subscriptionFilterPaths(filterNode)
+	if err != nil {
+		return sub, nil, err
+	}
+
+	return sub, paths, nil
+}
+
+func subscriptionFilterPaths(filterNode *xmlquery.Node) ([]string, error) {
+	filterType := strings.TrimSpace(filterNode.SelectAttr("type"))
+	if filterType == "" {
+		filterType = "subtree"
+	}
+
+	switch filterType {
+	case "xpath":
+		selectAttr := strings.TrimSpace(filterNode.SelectAttr("select"))
+		if selectAttr == "" {
+			return nil, errors.New("missing xpath select")
+		}
+		if !isSimpleSubscriptionXPath(selectAttr) {
+			return nil, errors.New("unsupported xpath filter")
+		}
+		return []string{selectAttr}, nil
+	case "subtree":
+		return subscriptionSubtreePaths(filterNode)
+	default:
+		return nil, errors.New("unsupported filter type")
+	}
+}
+
+func subscriptionSubtreePaths(filterNode *xmlquery.Node) ([]string, error) {
+	var paths []string
+
+	for _, modelContainer := range xmlquery.Find(filterNode, "./*") {
+		basePath := "/" + modelContainer.Data
+		if len(xmlquery.Find(modelContainer, "./*")) == 0 {
+			paths = append(paths, basePath)
+			continue
+		}
+		childPaths, err := subscriptionChildPaths(modelContainer, basePath)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, childPaths...)
+	}
+
+	return dedupeStrings(paths), nil
+}
+
+func subscriptionChildPaths(node *xmlquery.Node, currentPath string) ([]string, error) {
+	children := xmlquery.Find(node, "./*")
+	if len(children) == 0 {
+		return []string{currentPath}, nil
+	}
+
+	var paths []string
+	keySet := subscriptionKeySet(currentPath)
+	for _, child := range children {
+		if _, isKey := keySet[child.Data]; isKey {
+			continue
+		}
+
+		childPath := currentPath + "/" + child.Data
+		childPath = appendSubscriptionKeys(child, childPath)
+
+		grandChildren := xmlquery.Find(child, "./*")
+		if len(grandChildren) == 0 {
+			if hasDirectText(child) {
+				return nil, errors.New("subtree filter values are not supported")
+			}
+			paths = append(paths, childPath)
+			continue
+		}
+		childPaths, err := subscriptionChildPaths(child, childPath)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, childPaths...)
+	}
+	if len(paths) == 0 {
+		paths = append(paths, currentPath)
+	}
+	return paths, nil
+}
+
+func appendSubscriptionKeys(node *xmlquery.Node, path string) string {
+	keys := subscriptionKeys(path)
+	for _, key := range keys {
+		keyNode := xmlquery.FindOne(node, "./*[local-name() = '"+key+"']/text()")
+		if keyNode != nil {
+			path += "[" + key + "=" + strings.TrimSpace(keyNode.Data) + "]"
+		}
+	}
+
+	return path
+}
+
+func subscriptionKeySet(path string) map[string]struct{} {
+	keys := subscriptionKeys(path)
+	keySet := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		keySet[key] = struct{}{}
+	}
+	return keySet
+}
+
+func subscriptionKeys(path string) []string {
+	pathWithoutKeys := stripSubscriptionPredicates(path)
+	for _, keyPath := range subscriptionKeyPathCandidates(pathWithoutKeys) {
+		if strings.Contains(keyPath, "sonic") {
+			if keys := netconf_codegen.SonicMap[keyPath]; len(keys) > 0 {
+				return keys
+			}
+			continue
+		}
+		if keys := netconf_codegen.CommonMap[keyPath]; len(keys) > 0 {
+			return keys
+		}
+	}
+	return nil
+}
+
+func subscriptionKeyPathCandidates(path string) []string {
+	candidates := []string{path}
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" || strings.Contains(parts[0], ":") {
+		return candidates
+	}
+
+	prefixedRoot := parts[0] + ":" + parts[0]
+	candidates = append(candidates, "/"+prefixedRoot)
+	if len(parts) > 1 {
+		candidates[len(candidates)-1] += "/" + strings.Join(parts[1:], "/")
+	}
+	return candidates
+}
+
+func stripSubscriptionPredicates(path string) string {
+	var b strings.Builder
+	inPredicate := false
+	for _, r := range path {
+		switch r {
+		case '[':
+			inPredicate = true
+		case ']':
+			inPredicate = false
+		default:
+			if !inPredicate {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+func hasDirectText(node *xmlquery.Node) bool {
+	textNode := xmlquery.FindOne(node, "text()")
+	return textNode != nil && strings.TrimSpace(textNode.Data) != ""
+}
+
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	var deduped []string
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		deduped = append(deduped, value)
+	}
+	return deduped
+}
+
+func isSimpleSubscriptionXPath(selectAttr string) bool {
+	if !strings.HasPrefix(selectAttr, "/") {
+		return false
+	}
+	return !strings.ContainsAny(selectAttr, "|()")
 }
 
 func ParseGetRequest(node *xmlquery.Node, appendAll bool) ([]GetRequest, error) {
@@ -107,10 +322,9 @@ func ParseGetRequest(node *xmlquery.Node, appendAll bool) ([]GetRequest, error) 
 
 				glog.Infof("Searching for keys and updating path")
 
-				
 				for _, key := range keys {
 					keyNode := xmlquery.FindOne(child, "//*[local-name() = '"+key+"']")
-					
+
 					if keyNode != nil {
 						glog.Infof("Keynode %s found %+v", key, keyNode)
 
@@ -127,7 +341,6 @@ func ParseGetRequest(node *xmlquery.Node, appendAll bool) ([]GetRequest, error) 
 						// }
 					}
 				}
-
 
 				listFilters := []string{}
 
@@ -158,7 +371,7 @@ func ParseGetRequest(node *xmlquery.Node, appendAll bool) ([]GetRequest, error) 
 	glog.Infof("Paths found in get request", queryPaths)
 
 	return queryPaths, nil
-} 
+}
 
 func ParseGetSchemaRequest(node *xmlquery.Node) (GetSchema, error) {
 	identifier := xmlquery.FindOne(node, "//identifier/text()")
@@ -286,7 +499,6 @@ func extractTransactionalRequestByOpTag2(node *xmlquery.Node, opTag string) ([]C
 
 				listOp := getOperation(list, "merge")
 
-				
 				listPath := config.path + "/" + innerContainer.Data + "/" + list.Data
 				var leafListSet map[string]bool
 				if strings.Contains(listPath, "sonic") {
@@ -321,7 +533,6 @@ func extractTransactionalRequestByOpTag2(node *xmlquery.Node, opTag string) ([]C
 						leafText, _ = strconv.Unquote(str)
 					}
 
-					
 					if leafListSet[leafTag] {
 						if existing, exists := listItemData[leafTag]; exists {
 							listItemData[leafTag] = append(existing.([]interface{}), leafText)
@@ -378,7 +589,6 @@ func extractTransactionalRequestByOpTag3(node *xmlquery.Node, opTag string) ([]C
 
 				listOp := getOperation(list, "merge")
 
-				
 				listPath := config.path + "/" + innerContainer.Data + "/" + list.Data
 				var leafListSet map[string]bool
 				if strings.Contains(listPath, "sonic") {
@@ -413,7 +623,6 @@ func extractTransactionalRequestByOpTag3(node *xmlquery.Node, opTag string) ([]C
 						leafText, _ = strconv.Unquote(str)
 					}
 
-					
 					if leafListSet[leafTag] {
 						if existing, exists := listItemData[leafTag]; exists {
 							listItemData[leafTag] = append(existing.([]interface{}), leafText)

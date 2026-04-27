@@ -1,14 +1,20 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"io/ioutil"
+	"mime/multipart"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,7 +35,7 @@ var (
 	YangSchemas map[string][]Schema
 	YangModules ModulesState
 	read        = false
-	redisClient	*redis.Client
+	redisClient *redis.Client
 )
 
 func init() {
@@ -41,17 +47,19 @@ func init() {
 	})
 }
 
-type DbTarget string
-
-const (
-	ALL DbTarget = "all"
-	CONFIG DbTarget = "config"
-)
-
 func readYangModules() {
 	// return all schemas in module form
 	schemas := []Schema{}
 	YangSchemas = make(map[string][]Schema)
+
+	// Keep YANG library schema URL generation aligned with mgmt-framework:
+	// resolve management IP dynamically and build server address.
+	const netconfPort = 831
+	if ip := findAManagementIP(); len(ip) != 0 {
+		serverAddr := fmt.Sprintf("https://%s:%d", ip, netconfPort)
+		const yangPrefix = "/models/yang/"
+		translib.SetSchemaRootURL(strings.TrimSuffix(serverAddr, "/") + yangPrefix)
+	}
 
 	yangMod, err := translib.GetYanglibInfo()
 
@@ -100,7 +108,31 @@ func readYangModules() {
 	read = true
 }
 
-func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node, target DbTarget) (string, error) {
+// findAManagementIP returns a valid IPv4 address of eth0.
+// Empty string is returned if no address could be resolved.
+func findAManagementIP() string {
+	var addrs []net.Addr
+	eth0, err := net.InterfaceByName("eth0")
+	if err == nil {
+		addrs, err = eth0.Addrs()
+	}
+	if err != nil {
+		glog.Warningf("Could not read eth0 info; err=%v", err)
+		return ""
+	}
+
+	for _, addr := range addrs {
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err == nil && ip.To4() != nil {
+			return ip.String()
+		}
+	}
+
+	glog.Warning("Could not find a management address")
+	return ""
+}
+
+func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error) {
 
 	requests, err := ParseGetRequest(rootNode, false)
 
@@ -115,7 +147,7 @@ func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node, target DbTa
 		if !authenticator.Authorize("get", request.path) {
 			return "", errors.New(fmt.Sprintf("Unauthorized access %+s", request.path))
 		}
-		glog.Infof("Authorization passed %+s", request.path)
+		glog.Infof("[TACPLUS] authorization passed %+s", request.path)
 	}
 
 	resultStr := "<data>"
@@ -123,7 +155,7 @@ func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node, target DbTa
 	args := ""
 	for _, request := range requests {
 
-		pathResult, err := innerGetHandler(rootNode, request, target)
+		pathResult, err := innerGetHandler(rootNode, request)
 
 		if err != nil {
 			return "", errors.New("Failed to handle request")
@@ -135,19 +167,25 @@ func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node, target DbTa
 
 	// Account
 	if !authenticator.Account("get", args) {
-		return "", errors.New(fmt.Sprintf("Accounting failed get - args:%s", args))
+		return "", errors.New(fmt.Sprintf("[TACACAs] accounting failed get - args:%s", args))
 	}
 
-	glog.Infof("Accounting passed - get: %s", args)
+	glog.Infof("[TACPLUS] accounting passed - get: %s", args)
 
 	resultStr += "</data>"
 
 	return resultStr, nil
 }
 
-func innerGetHandler(rootNode *xmlquery.Node, request GetRequest, target DbTarget) (string, error) {
+func innerGetHandler(rootNode *xmlquery.Node, request GetRequest) (string, error) {
 
 	switch request.path {
+	case "/netconf:netconf/streams", "/netconf:netconf":
+		response, err := notificationStreamsXML()
+		if err != nil {
+			return "", errors.New("Unable to read notification streams")
+		}
+		return response, nil
 	case "/modules-state:modules-state":
 		response, err := xml.MarshalIndent(YangModules, "", "   ")
 		if err != nil {
@@ -161,7 +199,7 @@ func innerGetHandler(rootNode *xmlquery.Node, request GetRequest, target DbTarge
 	case "/operation:operation":
 		return "", nil
 	default:
-		req := translib.GetRequest{Path: request.path, QueryParams: translib.QueryParameters{Content: string(target)}}
+		req := translib.GetRequest{Path: request.path}
 		resp, err1 := translib.Get(req)
 		if err1 == nil {
 			translibResponse := string(resp.Payload)
@@ -237,7 +275,7 @@ func postChecks(rootNode *xmlquery.Node, jsonConv mxj.Map) mxj.Map {
 
 				if !exists || err != nil {
 					// Not translib edge case, continue
-					continue		
+					continue
 				}
 
 				values, err := jsonConv.ValuesForPath(modelContainer.Data + "." + child.Data)
@@ -270,14 +308,14 @@ func filterJson(input string, request GetRequest) (string, error) {
 	glog.Infof("Filtering input %+s with filters %+v", input, request.filters)
 
 	var i interface{}
-    if err := json.Unmarshal([]byte(input), &i); err != nil {
-        panic(err)
-    }
+	if err := json.Unmarshal([]byte(input), &i); err != nil {
+		panic(err)
+	}
 
 	// This logic needs a refactor, o(n^5) horrible complexity
 	for _, container := range i.(map[string]interface{}) {
 		// Container level
-		for listKey, list := range container.(map[string]interface{}){
+		for listKey, list := range container.(map[string]interface{}) {
 			glog.Infof("List key %+v, list %+v", listKey, list)
 
 			glog.Infof("Request path %+v", request.path)
@@ -301,7 +339,7 @@ func filterJson(input string, request GetRequest) (string, error) {
 						aa := arrObj.(map[string]interface{})
 
 						for k, _ := range aa {
-							glog.Infof("Reorder check %+s %+s", aa , k)
+							glog.Infof("Reorder check %+s %+s", aa, k)
 							// Check if the key exist in the filter, if so keep it. Delete anything else
 							if !contains(request.filters, k) {
 								delete(aa, k)
@@ -313,10 +351,10 @@ func filterJson(input string, request GetRequest) (string, error) {
 		}
 	}
 
-    output, err := json.Marshal(i)
-    if err != nil {
-        panic(err)
-    }
+	output, err := json.Marshal(i)
+	if err != nil {
+		panic(err)
+	}
 
 	return string(output), nil
 }
@@ -352,44 +390,44 @@ func reorderKeys(path string, xml []byte) []byte {
 			list := pathSplit[3]
 
 			if _, ok := arr[module].(map[string]interface{})[parent]; ok {
-				
+
 				// Main container request
 
 				listObj := arr[module].(map[string]interface{})[parent].(map[string]interface{})[list]
 
 				switch listObj.(type) {
-					case map[string]interface{}:
+				case map[string]interface{}:
 
-						listCast := arr[module].(map[string]interface{})[parent].(map[string]interface{})[list].(map[string]interface{})
+					listCast := arr[module].(map[string]interface{})[parent].(map[string]interface{})[list].(map[string]interface{})
+
+					for i, key := range keysReversed {
+						// We must check because in lists with 2 or more keys, if filtering is applied, some keys will not be in listCast
+						if val, ok := listCast[key]; ok {
+							val.(map[string]interface{})["#seq"] = -(i + 1)
+						}
+					}
+
+					arr[module].(map[string]interface{})[parent].(map[string]interface{})[list] = listCast
+
+				case []interface{}:
+
+					listArr := arr[module].(map[string]interface{})[parent].(map[string]interface{})[list].([]interface{})
+
+					for i, value := range listArr {
+
+						listItem := value.(map[string]interface{})
 
 						for i, key := range keysReversed {
 							// We must check because in lists with 2 or more keys, if filtering is applied, some keys will not be in listCast
-							if val, ok := listCast[key]; ok {
+							if val, ok := listItem[key]; ok {
 								val.(map[string]interface{})["#seq"] = -(i + 1)
 							}
 						}
 
-						arr[module].(map[string]interface{})[parent].(map[string]interface{})[list] = listCast
+						listArr[i] = listItem
+					}
 
-					case []interface{}:
-
-						listArr := arr[module].(map[string]interface{})[parent].(map[string]interface{})[list].([]interface{})
-
-						for i, value := range listArr {
-
-							listItem := value.(map[string]interface{})
-
-							for i, key := range keysReversed {
-								// We must check because in lists with 2 or more keys, if filtering is applied, some keys will not be in listCast
-								if val, ok := listItem[key]; ok {
-									val.(map[string]interface{})["#seq"] = -(i + 1)
-								}
-							}
-
-							listArr[i] = listItem
-						}
-
-						arr[module].(map[string]interface{})[parent].(map[string]interface{})[list] = listArr
+					arr[module].(map[string]interface{})[parent].(map[string]interface{})[list] = listArr
 				}
 
 			}
@@ -522,7 +560,7 @@ func EditRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 		if !authenticator.Authorize("edit-config", config.path) {
 			return "", errors.New(fmt.Sprintf("Unauthorized access %s", config.path))
 		}
-		glog.Infof("Authorization passed %s", config.path)
+		glog.Infof("[TACPLUS] authorization passed %s", config.path)
 	}
 
 	for _, config := range configs {
@@ -533,19 +571,23 @@ func EditRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 			return "", errors.New("Converting payload to byte array failed")
 		}
 
+		glog.Infof("[NETCONF_EDIT] Sending to translib: path=%s, operation=%s, payload=%s", config.path, config.operation, string(jsonStr))
+
 		req := translib.SetRequest{Path: config.path, Payload: jsonStr}
 
 		switch config.operation {
 		case "merge":
 			_, err = translib.Create(req)
 		case "create":
+			req.Strict = true
 			_, err = translib.Create(req)
 		case "remove":
 			_, err = translib.Delete(req)
 			if err != nil && err.Error() == "Resource not found" {
-				err = nil				
+				err = nil
 			}
 		case "replace":
+			req.Strict = false
 			_, err = translib.Replace(req)
 		case "delete":
 			_, err = translib.Delete(req)
@@ -559,11 +601,11 @@ func EditRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 
 		// Account
 		if !authenticator.Account("edit-config", config.path) {
-			return "", errors.New(fmt.Sprintf("Accounting failed edit-config - args:%s", config.path))
+			return "", errors.New(fmt.Sprintf("[TACACAs] accounting failed edit-config - args:%s", config.path))
 		}
 
-		glog.Infof("Accounting passed - edit-config: %s", config.path)
-		
+		glog.Infof("[TACPLUS] accounting passed - edit-config: %s", config.path)
+
 	}
 
 	return "ok", nil
@@ -604,9 +646,9 @@ func lockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 		return "", errors.New(fmt.Sprintf("Unauthorized access %+s", "lock"))
 	}
 
-	glog.Infof("Authorization passed %+s", "lock")
+	glog.Infof("[TACPLUS] authorization passed %+s", "lock")
 
-	lockAcquired, _ := redisClient.SetNX("CONFIG_LOCK", context.Value("uuid"), 15 * time.Second).Result()
+	lockAcquired, _ := redisClient.SetNX("CONFIG_LOCK", context.Value("uuid"), 15*time.Second).Result()
 
 	if !lockAcquired {
 		return "", errors.New("Lock failed, lock is already held")
@@ -616,10 +658,10 @@ func lockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 
 	// Account
 	if !authenticator.Account("get", "") {
-		return "", errors.New(fmt.Sprintf("Accounting failed lock - args:%s", ""))
+		return "", errors.New(fmt.Sprintf("[TACACAs] accounting failed lock - args:%s", ""))
 	}
 
-	glog.Infof("Accounting passed - lock: %s", "")
+	glog.Infof("[TACPLUS] accounting passed - lock: %s", "")
 
 	return resultStr, nil
 }
@@ -641,7 +683,7 @@ func unlockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string,
 		return "", errors.New(fmt.Sprintf("Unauthorized access %+s", "unlock"))
 	}
 
-	glog.Infof("Authorization passed %+s", "lock")
+	glog.Infof("[TACPLUS] authorization passed %+s", "lock")
 
 	lock, err := redisClient.Get("CONFIG_LOCK").Result()
 
@@ -661,15 +703,55 @@ func unlockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string,
 
 	// Account
 	if !authenticator.Account("unlock", "") {
-		return "", errors.New(fmt.Sprintf("Accounting failed unlock - args:%s", ""))
+		return "", errors.New(fmt.Sprintf("[TACACAs] accounting failed unlock - args:%s", ""))
 	}
 
-	glog.Infof("Accounting passed - unlock: %s", "")
+	glog.Infof("[TACPLUS] accounting passed - unlock: %s", "")
 
 	return "ok", nil
 }
 
-func commitRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error){
+func RpcRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error) {
+
+	glog.Infof("RPC request handler")
+
+	requests, err := ParseRPCRequest(rootNode)
+
+	if err != nil {
+		return "", err
+	}
+
+	glog.Info("requests %+v", requests)
+
+	request := requests[0]
+	jsonStr, _ := json.Marshal(request.payload)
+	req := translib.ActionRequest{Path: request.path, Payload: []byte(jsonStr)}
+	resp, err := translib.Action(req)
+
+	if err != nil {
+		return "", err
+	}
+
+	glog.Infof("RPC request %+v Response %v", request, resp)
+
+	if string(resp.Payload) != "" {
+		return "<data>" + string(resp.Payload) + "</data>", nil
+	}
+
+	// for _, request := range requests {
+	// 	jsonStr, _ := json.Marshal(request.payload)
+	// 	req := translib.ActionRequest{Path: request.path, Payload: []byte(jsonStr)}
+	// 	resp, err := translib.Action(req)
+	// 	if err != nil {
+	// 		return "", err
+	// 	}
+	// 	glog.Infof("RPC request %+v Response %v", request, resp)
+	// }
+
+	return "ok", nil
+}
+
+func commitRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error) {
 
 	authenticator := context.Value("auth").(lib.Authenticator)
 
@@ -677,7 +759,7 @@ func commitRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string,
 		return "", errors.New(fmt.Sprintf("Unauthorized access %s", "commit"))
 	}
 
-	glog.Infof("Authorization passed %s", "commit")
+	glog.Infof("[TACPLUS] authorization passed %s", "commit")
 
 	err := saveConfig()
 
@@ -689,9 +771,114 @@ func commitRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string,
 		return "", errors.New(fmt.Sprintf("Accounting failed cmd:%s", "commit"))
 	}
 
-	glog.Infof("Accounting passed - %s", "commit")
+	glog.Infof("[TACPLUS] accounting passed - %s", "commit")
 
 	return "ok", nil
+}
+
+func copyConfigRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error) {
+
+	targetNode := xmlquery.FindOne(rootNode, "//*[local-name() = 'target']/*")
+	if targetNode == nil {
+		return "", errors.New("target store unsepecified")
+	}
+
+	sourceNode := xmlquery.FindOne(rootNode, "//*[local-name() = 'source']/*")
+	if sourceNode == nil {
+		return "", errors.New("source store unsepecified")
+	}
+
+	authenticator := context.Value("auth").(lib.Authenticator)
+
+	if !authenticator.Authorize("copy-config", "") {
+		return "", errors.New(fmt.Sprintf("Unauthorized access %s", "copy-config"))
+	}
+
+	glog.Infof("[TACPLUS] authorization passed %s", "copy-config")
+
+	if targetNode.Data == "startup" && sourceNode.Data == "running" {
+		// Copy run start
+		err := saveConfig()
+		if err != nil {
+			return "", errors.New("Unable to copy running store to startup store, configuration will not persist after reboot")
+		}
+	} else if targetNode.Data == "url" && sourceNode.Data == "startup" {
+		// Backup startup config to a url
+		glog.Info("Bakcup startup to url")
+
+		urlNode := xmlquery.FindOne(targetNode, "//*[local-name() = 'url']/text()")
+		if urlNode == nil {
+			return "", errors.New("Unable to parse url tag")
+		}
+
+		if err := UploadFile("/etc/sonic/config_db.json", urlNode.Data); err != nil {
+			return "", err
+		}
+
+	} else {
+		return "", errors.New("Unsupported combination of source and target nodes")
+	}
+
+	if !authenticator.Account("copy-config", "") {
+		return "", errors.New(fmt.Sprintf("Accounting failed cmd:%s", "copy-config"))
+	}
+
+	glog.Infof("[TACPLUS] accounting passed - %s", "copy-config")
+
+	return "ok", nil
+}
+
+func UploadFile(path string, targetUrl string) error {
+
+	form := new(bytes.Buffer)
+	writer := multipart.NewWriter(form)
+
+	fw, err := writer.CreateFormFile("files", filepath.Base(path))
+	if err != nil {
+		return err
+	}
+
+	fd, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+
+	defer fd.Close()
+	_, err = io.Copy(fw, fd)
+	if err != nil {
+		return err
+	}
+
+	writer.Close()
+
+	client := &http.Client{}
+
+	req, err := http.NewRequest("POST", targetUrl, form)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// req.SetBasicAuth(username, password)
+	resp, err := client.Do(req)
+
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	bodyText, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 && resp.StatusCode != 204 {
+		return errors.New("Upload request returned an invalid status code: [" + strconv.Itoa(resp.StatusCode) + "]")
+	}
+
+	glog.Infof("Sucessfull upload request response %+s", bodyText)
+	return nil
 }
 
 func saveConfig() error {
@@ -700,7 +887,7 @@ func saveConfig() error {
 	exists, err := redisClient.Exists("VERSIONS|CONFIGURATION").Result()
 
 	if err == nil && exists == 1 {
-		
+
 		result, err := redisClient.HGetAll("VERSIONS|CONFIGURATION").Result()
 
 		if version, ok := result["VERSION"]; err == nil && ok {
@@ -714,7 +901,7 @@ func saveConfig() error {
 				_, err = redisClient.HSet("VERSIONS|CONFIGURATION", "VERSION", newVersion).Result()
 
 				if err == nil {
-					glog.Infof("Updated configuration version from %d to %d", version , newVersion)
+					glog.Infof("Updated configuration version from %d to %d", version, newVersion)
 				}
 
 			}
@@ -730,8 +917,14 @@ func saveConfig() error {
 		return err
 	}
 
-	glog.Infof("Configuration saved");
+	glog.Infof("Configuration saved")
 
 	return nil
 }
 
+func Reverse(s []string) []string {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+	return s
+}

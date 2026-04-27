@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"orange/sonic-netconf-server/lib"
@@ -25,6 +26,8 @@ const (
 )
 
 func SessionHandler(s ssh.Session) {
+	setSessionWriteMu(s)
+	defer cancelActiveSubscription(s)
 
 	scanner := bufio.NewScanner(s)
 	scanner.Split(SplitAt)
@@ -46,7 +49,9 @@ func SessionHandler(s ssh.Session) {
 		fmt.Printf("\nReceving request <<< %s >>> \n %s \n\n", time.Now().Local().String(), requestStr)
 		response := process(s, requestStr)
 		fmt.Printf("\nSending response <<< %s >>> \n %s \n\n", time.Now().Local().String(), response)
-		writeResponse(s, response)
+		if response != notificationHandledSentinel {
+			writeResponse(s, response)
+		}
 	}
 }
 
@@ -63,6 +68,7 @@ func capabilitesXML() string {
 	serverHello.Capabilities = append(serverHello.Capabilities, CapXPath)
 	serverHello.Capabilities = append(serverHello.Capabilities, CapMonitoring)
 	serverHello.Capabilities = append(serverHello.Capabilities, CapStartup)
+	serverHello.Capabilities = append(serverHello.Capabilities, CapNotification)
 
 	if !read {
 		readYangModules()
@@ -123,7 +129,14 @@ func process(session ssh.Session, requestStr string) string {
 	response, err := handleRequest(session, rootNode)
 
 	if err != nil {
+		if rpcErrorResponse, ok := isRPCErrorResponse(err); ok {
+			return rpcErrorResponse
+		}
 		return createErrorResponse(messageId, err)
+	}
+
+	if response == notificationHandledSentinel {
+		return notificationHandledSentinel
 	}
 
 	return CreateResponse(messageId, []byte(response))
@@ -135,14 +148,26 @@ func handleRequest(session ssh.Session, requestNode *xmlquery.Node) (string, err
 	var err error
 
 	typeNode := xmlquery.FindOne(requestNode, "//*[local-name() = 'rpc']/*") // Get request type (get or edit-config)
+	if typeNode == nil {
+		return "", errors.New("Unsupported command")
+	}
 
 	context := session.Context().(ssh.Context)
+	if sub, ok := context.Value(ctxKeySubscription).(*subscriptionState); ok && sub.isActive() {
+		switch typeNode.Data {
+		case "close-session", "kill-session":
+		case "create-subscription":
+			return "", buildRPCError(requestNode.SelectAttr("message-id"), "protocol", "operation-failed", "error", "")
+		default:
+			return "", buildRPCError(requestNode.SelectAttr("message-id"), "protocol", "resource-denied", "error", typeNode.Data)
+		}
+	}
 
 	switch typeNode.Data {
 	case "get":
-		response, err = GetRequestHandler(context, requestNode, ALL)
+		response, err = GetRequestHandler(context, requestNode)
 	case "get-config":
-		response, err = GetRequestHandler(context, requestNode, CONFIG)
+		response, err = GetRequestHandler(context, requestNode)
 	case "edit-config":
 		response, err = EditRequestHandler(context, requestNode)
 	case "get-schema":
@@ -151,12 +176,29 @@ func handleRequest(session ssh.Session, requestNode *xmlquery.Node) (string, err
 		response, err = commitRequestHandler(context, requestNode)
 	case "close-session", "kill-session":
 		return withAuth(context, "close-session", func() (string, error) {
+			cancelActiveSubscription(session)
+			if context.Value("auth-type").(string) == "tacacs" {
+				tacConn := context.Value("auth").(lib.TacacsAuthenticator)
+				glog.Infof("[TACPLUS] Closing tacacs server connection")
+				tacConn.Disconnect()
+				context.SetValue("auth", nil) // completely remove tacacs connection reference
+				time.AfterFunc(1*time.Second, func() { session.Close() })
+			}
 			return "ok", nil
 		})
 	case "lock":
 		response, err = lockRequestHandler(context, requestNode)
 	case "unlock":
 		response, err = unlockRequestHandler(context, requestNode)
+	case "sonic-rpc":
+		response, err = RpcRequestHandler(context, requestNode)
+	case "copy-config":
+		response, err = copyConfigRequestHandler(context, requestNode)
+	case "create-subscription":
+		err = createSubscriptionHandler(session, requestNode)
+		if err == nil {
+			response = notificationHandledSentinel
+		}
 	default:
 		return "", errors.New("Unsupported command")
 	}
@@ -189,6 +231,9 @@ func CreateResponse(messageId string, responsePayload []byte) string {
 
 func writeResponse(session ssh.Session, message string) {
 	responseString := fmt.Sprintf(ChunkedMessage, len(message), message)
+	mu := setSessionWriteMu(session)
+	mu.Lock()
+	defer mu.Unlock()
 	session.Write([]byte(responseString))
 }
 
@@ -270,7 +315,7 @@ func withAuth(context ssh.Context, command string, fn func() (string, error)) (s
 		return "", errors.New(fmt.Sprintf("Unauthorized access %s", command))
 	}
 
-	glog.Infof("Authorization passed %s", command)
+	glog.Infof("[TACPLUS] authorization passed %s", command)
 
 	response, err := fn()
 
@@ -282,7 +327,33 @@ func withAuth(context ssh.Context, command string, fn func() (string, error)) (s
 		return "", errors.New(fmt.Sprintf("Accounting failed cmd:%s", command))
 	}
 
-	glog.Infof("Accounting passed - %s", command)
+	glog.Infof("[TACPLUS] accounting passed - %s", command)
 
 	return response, nil
+}
+
+func setSessionWriteMu(session ssh.Session) *sync.Mutex {
+	context := session.Context().(ssh.Context)
+	if mu, ok := context.Value(ctxKeyWriteMu).(*sync.Mutex); ok {
+		return mu
+	}
+
+	mu := newSessionWriteMu()
+	context.SetValue(ctxKeyWriteMu, mu)
+	return mu
+}
+
+func cancelActiveSubscription(session ssh.Session) {
+	context := session.Context().(ssh.Context)
+	sub, ok := context.Value(ctxKeySubscription).(*subscriptionState)
+	if !ok || !sub.deactivate() {
+		return
+	}
+
+	if sub.cancelChan != nil {
+		safeClose(sub.cancelChan)
+	}
+	if sub.stopTrans != nil {
+		safeClose(sub.stopTrans)
+	}
 }
