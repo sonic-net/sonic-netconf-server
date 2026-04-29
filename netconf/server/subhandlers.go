@@ -137,7 +137,7 @@ func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, er
 	requests, err := ParseGetRequest(rootNode, false)
 
 	if err != nil {
-		return "", err
+		return "", buildRPCError(rootNode.SelectAttr("message-id"), "protocol", "invalid-value", "error", "filter")
 	}
 
 	authenticator := context.Value("auth").(lib.Authenticator)
@@ -158,6 +158,10 @@ func GetRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, er
 		pathResult, err := innerGetHandler(rootNode, request)
 
 		if err != nil {
+			if request.unfiltered {
+				glog.Infof("Skipping unfiltered get path %s: %v", request.path, err)
+				continue
+			}
 			return "", errors.New("Failed to handle request")
 		}
 
@@ -263,6 +267,9 @@ func innerGetHandler(rootNode *xmlquery.Node, request GetRequest) (string, error
 func postChecks(rootNode *xmlquery.Node, jsonConv mxj.Map) mxj.Map {
 
 	filterNode := xmlquery.FindOne(rootNode, "//filter")
+	if filterNode == nil || strings.TrimSpace(filterNode.SelectAttr("type")) == "xpath" {
+		return jsonConv
+	}
 	containers := xmlquery.Find(filterNode, "./*")
 
 	for _, modelContainer := range containers {

@@ -21,8 +21,9 @@ type Config struct {
 }
 
 type GetRequest struct {
-	path    string
-	filters []string
+	path       string
+	filters    []string
+	unfiltered bool
 }
 
 type RPCRequest struct {
@@ -255,7 +256,18 @@ func ParseGetRequest(node *xmlquery.Node, appendAll bool) ([]GetRequest, error) 
 	filterNode := xmlquery.FindOne(node, "//filter")
 
 	if filterNode == nil {
-		return []GetRequest{}, errors.New("Need filter element, can't return all configuration for now")
+		return unfilteredGetRequests(), nil
+	}
+
+	filterType := strings.TrimSpace(filterNode.SelectAttr("type"))
+	if filterType == "" {
+		filterType = "subtree"
+	}
+	if filterType == "xpath" {
+		return parseGetXPathFilter(filterNode)
+	}
+	if filterType != "subtree" {
+		return nil, errors.New("unsupported filter type")
 	}
 
 	queryPaths := []GetRequest{}
@@ -371,6 +383,230 @@ func ParseGetRequest(node *xmlquery.Node, appendAll bool) ([]GetRequest, error) 
 	glog.Infof("Paths found in get request", queryPaths)
 
 	return queryPaths, nil
+}
+
+func unfilteredGetRequests() []GetRequest {
+	seen := map[string]struct{}{}
+	var paths []string
+
+	for path := range netconf_codegen.SonicMap {
+		addTopLevelGetPath(path, seen, &paths)
+	}
+	for path := range netconf_codegen.CommonMap {
+		addTopLevelGetPath(path, seen, &paths)
+	}
+
+	sort.Strings(paths)
+	requests := make([]GetRequest, 0, len(paths))
+	for _, path := range paths {
+		requests = append(requests, GetRequest{path: path, unfiltered: true})
+	}
+	return requests
+}
+
+func addTopLevelGetPath(path string, seen map[string]struct{}, paths *[]string) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return
+	}
+
+	root := "/" + parts[0]
+	if _, ok := seen[root]; ok {
+		return
+	}
+	seen[root] = struct{}{}
+	*paths = append(*paths, root)
+}
+
+func parseGetXPathFilter(filterNode *xmlquery.Node) ([]GetRequest, error) {
+	selectAttr := strings.TrimSpace(filterNode.SelectAttr("select"))
+	if selectAttr == "" {
+		return nil, errors.New("missing xpath select")
+	}
+	if len(xmlquery.Find(filterNode, "./*")) > 0 || hasDirectText(filterNode) {
+		return nil, errors.New("xpath filter body must be empty")
+	}
+	if !isSupportedGetXPath(selectAttr) {
+		return nil, errors.New("unsupported xpath filter")
+	}
+
+	request, err := getRequestFromXPath(selectAttr)
+	if err != nil {
+		return nil, err
+	}
+	return []GetRequest{request}, nil
+}
+
+func isSupportedGetXPath(selectAttr string) bool {
+	if !strings.HasPrefix(selectAttr, "/") {
+		return false
+	}
+	if strings.Contains(selectAttr, "//") || strings.Contains(selectAttr, "..") || strings.Contains(selectAttr, "::") {
+		return false
+	}
+	return !strings.ContainsAny(selectAttr, "|()")
+}
+
+func getRequestFromXPath(selectAttr string) (GetRequest, error) {
+	segments, err := splitXPathSegments(selectAttr)
+	if err != nil {
+		return GetRequest{}, err
+	}
+	if len(segments) == 0 {
+		return GetRequest{}, errors.New("empty xpath filter")
+	}
+
+	var pathParts []string
+	for i, segment := range segments {
+		name, predicates, err := parseXPathSegment(segment)
+		if err != nil {
+			return GetRequest{}, err
+		}
+		if i == 0 {
+			name = normalizeGetXPathRoot(name)
+		}
+		currentPath := "/" + strings.Join(append(pathParts, name), "/")
+		keys := subscriptionKeys(currentPath)
+		if len(keys) > 0 {
+			keySet := make(map[string]struct{}, len(keys))
+			for _, key := range keys {
+				keySet[key] = struct{}{}
+			}
+			for _, predicate := range predicates {
+				if _, ok := keySet[predicate.key]; !ok {
+					return GetRequest{}, errors.New("unsupported xpath predicate")
+				}
+				name += "[" + predicate.key + "=" + predicate.value + "]"
+			}
+		} else if len(predicates) > 0 {
+			return GetRequest{}, errors.New("xpath predicate on non-list path")
+		}
+		pathParts = append(pathParts, name)
+	}
+
+	path := "/" + strings.Join(pathParts, "/")
+	if len(pathParts) > 1 {
+		leaf := pathParts[len(pathParts)-1]
+		parentPath := "/" + strings.Join(pathParts[:len(pathParts)-1], "/")
+		if !strings.Contains(leaf, "[") && len(subscriptionKeys(parentPath)) > 0 {
+			return GetRequest{path: parentPath, filters: []string{leaf}}, nil
+		}
+	}
+
+	return GetRequest{path: path}, nil
+}
+
+type xpathPredicate struct {
+	key   string
+	value string
+}
+
+func splitXPathSegments(path string) ([]string, error) {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return nil, errors.New("empty xpath filter")
+	}
+
+	var segments []string
+	var b strings.Builder
+	inPredicate := false
+	var quote rune
+	for _, r := range trimmed {
+		switch {
+		case quote != 0:
+			b.WriteRune(r)
+			if r == quote {
+				quote = 0
+			}
+		case r == '\'' || r == '"':
+			quote = r
+			b.WriteRune(r)
+		case r == '[':
+			inPredicate = true
+			b.WriteRune(r)
+		case r == ']':
+			inPredicate = false
+			b.WriteRune(r)
+		case r == '/' && !inPredicate:
+			if b.Len() == 0 {
+				return nil, errors.New("invalid xpath segment")
+			}
+			segments = append(segments, b.String())
+			b.Reset()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if quote != 0 || inPredicate {
+		return nil, errors.New("unterminated xpath predicate")
+	}
+	if b.Len() == 0 {
+		return nil, errors.New("invalid xpath segment")
+	}
+	segments = append(segments, b.String())
+	return segments, nil
+}
+
+func parseXPathSegment(segment string) (string, []xpathPredicate, error) {
+	nameEnd := strings.Index(segment, "[")
+	if nameEnd == -1 {
+		if segment == "" {
+			return "", nil, errors.New("empty xpath segment")
+		}
+		return segment, nil, nil
+	}
+
+	name := segment[:nameEnd]
+	if name == "" {
+		return "", nil, errors.New("empty xpath segment")
+	}
+
+	var predicates []xpathPredicate
+	rest := segment[nameEnd:]
+	for rest != "" {
+		if !strings.HasPrefix(rest, "[") {
+			return "", nil, errors.New("invalid xpath predicate")
+		}
+		end := strings.Index(rest, "]")
+		if end == -1 {
+			return "", nil, errors.New("unterminated xpath predicate")
+		}
+		rawPredicate := strings.TrimSpace(rest[1:end])
+		predicate, err := parseXPathPredicate(rawPredicate)
+		if err != nil {
+			return "", nil, err
+		}
+		predicates = append(predicates, predicate)
+		rest = rest[end+1:]
+	}
+
+	return name, predicates, nil
+}
+
+func parseXPathPredicate(rawPredicate string) (xpathPredicate, error) {
+	parts := strings.SplitN(rawPredicate, "=", 2)
+	if len(parts) != 2 {
+		return xpathPredicate{}, errors.New("unsupported xpath predicate")
+	}
+
+	key := strings.TrimSpace(strings.TrimPrefix(parts[0], "@"))
+	value := strings.TrimSpace(parts[1])
+	value = strings.Trim(value, `"'`)
+	if key == "" || value == "" {
+		return xpathPredicate{}, errors.New("invalid xpath predicate")
+	}
+	if strings.ContainsAny(key, " \t\r\n") {
+		return xpathPredicate{}, errors.New("invalid xpath predicate key")
+	}
+
+	return xpathPredicate{key: key, value: value}, nil
+}
+
+func normalizeGetXPathRoot(root string) string {
+	if strings.Contains(root, ":") {
+		return root
+	}
+	return root + ":" + root
 }
 
 func ParseGetSchemaRequest(node *xmlquery.Node) (GetSchema, error) {
