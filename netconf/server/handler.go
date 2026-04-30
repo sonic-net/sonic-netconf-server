@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -305,6 +306,17 @@ func SplitAt(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		return 0, nil, nil
 	}
 
+	if isChunkedFraming(data) {
+		advance, token, err, needMore := parseChunkedToken(data, atEOF)
+		if err != nil {
+			return 0, nil, err
+		}
+		if needMore {
+			return 0, nil, nil
+		}
+		return advance, token, nil
+	}
+
 	// Find the index of the input of the separator substring
 	if i := strings.Index(string(data), RPCDelimiter); i >= 0 {
 		return i + len(RPCDelimiter), data[0:i], nil
@@ -322,6 +334,112 @@ func SplitAt(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	return 0, nil, nil
 }
 
+func isChunkedFraming(data []byte) bool {
+	i := 0
+	for i < len(data) && (data[i] == '\n' || data[i] == '\r') {
+		i++
+	}
+	return i < len(data) && data[i] == '#'
+}
+
+func parseChunkedToken(data []byte, atEOF bool) (advance int, token []byte, err error, needMore bool) {
+	i := 0
+	for i < len(data) && (data[i] == '\n' || data[i] == '\r') {
+		i++
+	}
+
+	payload := make([]byte, 0, len(data))
+	for {
+		if i >= len(data) {
+			if atEOF {
+				return 0, nil, errors.New("incomplete NETCONF 1.1 chunked message"), false
+			}
+			return 0, nil, nil, true
+		}
+		if data[i] != '#' {
+			return 0, nil, errors.New("invalid NETCONF 1.1 chunk framing"), false
+		}
+
+		// End marker: ##\n
+		if i+1 < len(data) && data[i+1] == '#' {
+			i += 2
+			if i < len(data) && data[i] == '\r' {
+				i++
+			}
+			if i >= len(data) {
+				if atEOF {
+					return i, payload, nil, false
+				}
+				return 0, nil, nil, true
+			}
+			if data[i] != '\n' {
+				return 0, nil, errors.New("invalid NETCONF 1.1 chunk end"), false
+			}
+			i++
+			return i, payload, nil, false
+		}
+
+		// Chunk header: #<size>\n
+		sizeStart := i + 1
+		sizeEnd := sizeStart
+		for sizeEnd < len(data) && data[sizeEnd] >= '0' && data[sizeEnd] <= '9' {
+			sizeEnd++
+		}
+		if sizeEnd == sizeStart {
+			return 0, nil, errors.New("invalid NETCONF 1.1 chunk size"), false
+		}
+		if sizeEnd >= len(data) {
+			if atEOF {
+				return 0, nil, errors.New("incomplete NETCONF 1.1 chunk header"), false
+			}
+			return 0, nil, nil, true
+		}
+
+		lineEnd := sizeEnd
+		if data[lineEnd] == '\r' {
+			lineEnd++
+			if lineEnd >= len(data) {
+				if atEOF {
+					return 0, nil, errors.New("incomplete NETCONF 1.1 chunk header"), false
+				}
+				return 0, nil, nil, true
+			}
+		}
+		if data[lineEnd] != '\n' {
+			return 0, nil, errors.New("invalid NETCONF 1.1 chunk header"), false
+		}
+
+		chunkSize, convErr := strconv.Atoi(string(data[sizeStart:sizeEnd]))
+		if convErr != nil || chunkSize < 0 {
+			return 0, nil, errors.New("invalid NETCONF 1.1 chunk size"), false
+		}
+
+		chunkStart := lineEnd + 1
+		chunkEnd := chunkStart + chunkSize
+		if chunkEnd > len(data) {
+			if atEOF {
+				return 0, nil, errors.New("incomplete NETCONF 1.1 chunk payload"), false
+			}
+			return 0, nil, nil, true
+		}
+		payload = append(payload, data[chunkStart:chunkEnd]...)
+
+		i = chunkEnd
+		if i < len(data) && data[i] == '\r' {
+			i++
+		}
+		if i >= len(data) {
+			if atEOF {
+				return 0, nil, errors.New("incomplete NETCONF 1.1 chunk payload terminator"), false
+			}
+			return 0, nil, nil, true
+		}
+		if data[i] != '\n' {
+			return 0, nil, errors.New("invalid NETCONF 1.1 chunk payload terminator"), false
+		}
+		i++
+	}
+}
 func trimInput(input string) string {
 	trimmed := strings.Trim(string(input), "\n")
 	trimmed = strings.Trim(string(trimmed), "\r")
