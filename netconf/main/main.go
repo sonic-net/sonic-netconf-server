@@ -13,6 +13,7 @@ import (
 
 	"orange/sonic-netconf-server/lib"
 	"orange/sonic-netconf-server/netconf/server"
+	"orange/sonic-netconf-server/tacplus"
 
 	gliderssh "github.com/gliderlabs/ssh"
 	"github.com/go-redis/redis/v7"
@@ -68,15 +69,48 @@ func main() {
 
 func authenticate(ctx gliderssh.Context, password string) bool {
 
-	pamAuthenticator := lib.NewPAMAuthenticator(ctx.User(), password)
+	if tacplus.IsTacacsAAAEnabled() {
 
-	if !pamAuthenticator.Authenticate() {
-		glog.Errorf("[PAM] Authentication failed user:(%s)", ctx.User())
-		return false
+		glog.Infof("TACACS enabled on AAA, creating a connection to tacacs server")
+
+		protocol, service, err := GetNetconfTacacsConfig()
+		if err != nil {
+			return false
+		}
+
+		glog.Infof("[TACPLUS] protocol: %s - service: %s", protocol, service)
+
+		tacAuthenticator, err := lib.NewTacacsAuthenticator(ctx, protocol, service, ctx.User(), password, ctx.RemoteAddr().String())
+
+		if err != nil {
+			return false
+		}
+
+		glog.Infof("Starting authentication")
+
+		if !tacAuthenticator.Authenticate() {
+			glog.Errorf("[TACPLUS] Authentication failed user:(%s)", ctx.User())
+			tacAuthenticator.Disconnect()
+			return false
+		}
+
+		ctx.SetValue("auth-type", "tacacs")
+		ctx.SetValue("auth", tacAuthenticator)
+	} else {
+
+		// No tacacs, authenticate with local credentials
+		glog.Infof("TACACS not enabled on AAA, authenticating with local credentials")
+
+		pamAuthenticator := lib.NewPAMAuthenticator(ctx.User(), password)
+
+		if !pamAuthenticator.Authenticate() {
+			glog.Errorf("[PAM] Authentication failed user:(%s)", ctx.User())
+			return false
+		}
+
+		ctx.SetValue("auth-type", "local")
+		ctx.SetValue("auth", pamAuthenticator)
 	}
-
-	ctx.SetValue("auth-type", "local")
-	ctx.SetValue("auth", pamAuthenticator)
 
 	ctx.SetValue("uuid", uuid.New().String())
 	glog.Infof("Authentication success user:(%s)", ctx.User())
@@ -122,4 +156,38 @@ func fileExists(path string) bool {
 		return false
 	}
 	return true
+}
+
+func GetNetconfTacacsConfig() (string, string, error) {
+
+	service := "netconf"
+	protocol := "ssh"
+
+	protocolConfigExists, err := redisClient.HExists("TACACS|NETCONF", "protocol").Result()
+	if err != nil {
+		return "", "", err
+	}
+
+	if protocolConfigExists {
+		protocol, err = redisClient.HGet("TACACS|NETCONF", "protocol").Result()
+		if err != nil {
+			return "", "", err
+		}
+		glog.Infof("Custom TACPLUS protocol: %s", protocol)
+	}
+
+	serviceConfigExists, err := redisClient.HExists("TACACS|NETCONF", "service").Result()
+	if err != nil {
+		return "", "", err
+	}
+
+	if serviceConfigExists {
+		service, err = redisClient.HGet("TACACS|NETCONF", "service").Result()
+		if err != nil {
+			return "", "", err
+		}
+		glog.Infof("Custom TACPLUS service: %s", service)
+	}
+
+	return protocol, service, nil
 }
