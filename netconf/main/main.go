@@ -23,13 +23,15 @@ import (
 )
 
 // Command line parameters
+const netconfKeyDir = "/etc/sonic/netconf"
+
 var (
 	port             int    // Server port
 	clientAuth       string // Client auth mode
 	redisClient      *redis.Client
 	tacplusConfigKey = "TACACS|NETCONF"
-	publicKeyPath    = "/etc/sonic/netconf-key.pub"
-	privateKeyPath   = "/etc/sonic/netconf-key"
+	publicKeyPath    = netconfKeyDir + "/netconf-key.pub"
+	privateKeyPath   = netconfKeyDir + "/netconf-key"
 )
 
 func init() {
@@ -91,6 +93,10 @@ func MakeSSHKeyPair(pubKeyPath, privateKeyPath string) error {
 	}
 
 	glog.Info("SSH keys not found, generating server keys")
+
+	if err := os.MkdirAll(netconfKeyDir, 0700); err != nil {
+		return err
+	}
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
