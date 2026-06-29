@@ -1,15 +1,18 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strconv"
+	"strings"
 
 	"orange/sonic-netconf-server/lib"
 	"orange/sonic-netconf-server/netconf/server"
@@ -23,11 +26,25 @@ import (
 )
 
 // Command line parameters
-const netconfKeyDir = "/etc/sonic/netconf"
+const (
+	netconfKeyDir              = "/etc/sonic/netconf"
+	defaultHostKeyAlgorithm    = "ed25519"
+	defaultHostKeyRSABits      = 3072
+	minimumHostKeyRSABits      = 2048
+	hostKeyAlgorithmED25519    = "ed25519"
+	hostKeyAlgorithmRSA        = "rsa"
+	hostKeyPrivateFileMode     = 0600
+	hostKeyPublicFileMode      = 0644
+	hostKeyDirectoryFileMode   = 0700
+	hostKeyRSAPrivatePEMType   = "RSA PRIVATE KEY"
+	hostKeyPKCS8PrivatePEMType = "PRIVATE KEY"
+)
 
 var (
 	port             int    // Server port
 	clientAuth       string // Client auth mode
+	hostKeyAlgorithm string
+	hostKeyRSABits   int
 	redisClient      *redis.Client
 	tacplusConfigKey = "TACACS|NETCONF"
 	publicKeyPath    = netconfKeyDir + "/netconf-key.pub"
@@ -38,6 +55,8 @@ func init() {
 	// Parse command line
 	flag.IntVar(&port, "port", 830, "Listen port")
 	flag.StringVar(&clientAuth, "client_auth", "none", "Client auth mode - none|cert|user|tacacs")
+	flag.StringVar(&hostKeyAlgorithm, "host_key_algorithm", defaultHostKeyAlgorithm, "SSH host key algorithm - ed25519|rsa")
+	flag.IntVar(&hostKeyRSABits, "host_key_rsa_bits", defaultHostKeyRSABits, "RSA host key size in bits when host_key_algorithm=rsa")
 	flag.Parse()
 	// Suppress warning messages related to logging before flag parse
 	flag.CommandLine.Parse([]string{})
@@ -52,7 +71,9 @@ func init() {
 
 func main() {
 
-	MakeSSHKeyPair(publicKeyPath, privateKeyPath)
+	if err := MakeSSHKeyPair(publicKeyPath, privateKeyPath); err != nil {
+		glog.Fatalf("Failed to generate SSH key pair: %v", err)
+	}
 
 	srv := &gliderssh.Server{Addr: ":" + strconv.Itoa(port), Handler: server.DefaultHandler}
 
@@ -94,34 +115,67 @@ func MakeSSHKeyPair(pubKeyPath, privateKeyPath string) error {
 
 	glog.Info("SSH keys not found, generating server keys")
 
-	if err := os.MkdirAll(netconfKeyDir, 0700); err != nil {
+	if err := os.MkdirAll(netconfKeyDir, hostKeyDirectoryFileMode); err != nil {
 		return err
 	}
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	privateKeyPEM, pub, err := generateHostKey(hostKeyAlgorithm, hostKeyRSABits)
 	if err != nil {
 		return err
 	}
 
 	// generate and write private key as PEM
-	privateKeyFile, err := os.OpenFile(privateKeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	privateKeyFile, err := os.OpenFile(privateKeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hostKeyPrivateFileMode)
 	if err != nil {
 		return err
 	}
 	defer privateKeyFile.Close()
 
-	privateKeyPEM := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}
 	if err := pem.Encode(privateKeyFile, privateKeyPEM); err != nil {
 		return err
 	}
 
-	// generate and write public key
-	pub, err := cryptossh.NewPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		return err
-	}
+	return ioutil.WriteFile(pubKeyPath, cryptossh.MarshalAuthorizedKey(pub), hostKeyPublicFileMode)
+}
 
-	return ioutil.WriteFile(pubKeyPath, cryptossh.MarshalAuthorizedKey(pub), 0644)
+func generateHostKey(algorithm string, rsaBits int) (*pem.Block, cryptossh.PublicKey, error) {
+	switch strings.ToLower(strings.TrimSpace(algorithm)) {
+	case hostKeyAlgorithmED25519:
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		privateKeyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		pub, err := cryptossh.NewPublicKey(publicKey)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return &pem.Block{Type: hostKeyPKCS8PrivatePEMType, Bytes: privateKeyBytes}, pub, nil
+	case hostKeyAlgorithmRSA:
+		if rsaBits < minimumHostKeyRSABits {
+			return nil, nil, fmt.Errorf("RSA host key size must be at least %d bits", minimumHostKeyRSABits)
+		}
+
+		privateKey, err := rsa.GenerateKey(rand.Reader, rsaBits)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		pub, err := cryptossh.NewPublicKey(&privateKey.PublicKey)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return &pem.Block{Type: hostKeyRSAPrivatePEMType, Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}, pub, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported host key algorithm %q", algorithm)
+	}
 }
 
 func fileExists(path string) bool {
