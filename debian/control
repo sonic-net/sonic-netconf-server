@@ -1,8 +1,6 @@
 Source: sonic-netconf-server
 Maintainer: Hossam Hassan <hossam4.hassan.ext@orange.com>
-Build-Depends: debhelper (>= 8.0.0),
-               dh-systemd
-               | debhelper (>= 9.20160709)
+Build-Depends: debhelper (>= 13)
 Standards-Version: 3.9.3
 Section: net
 

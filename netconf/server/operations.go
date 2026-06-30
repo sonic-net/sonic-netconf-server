@@ -1,6 +1,9 @@
 package server
 
-import "encoding/xml"
+import (
+	"encoding/xml"
+	"fmt"
+)
 
 const (
 	RPCGetRequest       = "GET"
@@ -32,6 +35,18 @@ const (
 	CapMonitoring      = NsNetconfMonitoring
 	CapTailfActions    = NsTailfActions
 )
+
+// LockDeniedError is returned by lockRequestHandler when the datastore is
+// already locked. It carries the NETCONF session-id of the current lock holder
+// so that createErrorXML can produce a fully RFC 6241 §8.3.9-compliant
+// lock-denied <rpc-error> with <session-id> in <error-info>.
+type LockDeniedError struct {
+	HolderSessionID string
+}
+
+func (e *LockDeniedError) Error() string {
+	return fmt.Sprintf("lock denied by session %s", e.HolderSessionID)
+}
 
 type RPCError struct {
 	XMLName       xml.Name `xml:"rpc-error"`

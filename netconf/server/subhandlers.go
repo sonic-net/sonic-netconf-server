@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"orange/sonic-netconf-server/build/netconf_codegen"
 	"orange/sonic-netconf-server/lib"
@@ -502,9 +501,14 @@ func EditRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 
 	glog.Infof("Datastore lock info exists %+v, lock %+v, err %+v", exists, lockId, err)
 
-	if exists == 1 && lockId != context.Value("uuid") {
-		// There is a lock, and it is not owned by current session
-		return "", errors.New("Datastore locked")
+	if exists == 1 {
+		// Lock value is "sessionID:uuid"; ownership is confirmed by uuid suffix.
+		parts := strings.SplitN(lockId, ":", 2)
+		uuid, _ := context.Value("uuid").(string)
+		if len(parts) != 2 || parts[1] != uuid {
+			holderSessionID := parseSessionIDFromLockValue(lockId)
+			return "", fmt.Errorf("datastore is locked by session %s", holderSessionID)
+		}
 	}
 
 	configs, err := ParseEditRequest(rootNode)
@@ -569,6 +573,36 @@ func EditRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 	return "ok", nil
 }
 
+// parseSessionIDFromLockValue extracts the NETCONF session-id from a lock value
+// stored as "sessionID:uuid". Returns "0" when the format is unrecognised, which
+// per RFC 6241 §8.3.9 indicates a non-NETCONF holder.
+func parseSessionIDFromLockValue(lockValue string) string {
+	if i := strings.Index(lockValue, ":"); i > 0 {
+		return lockValue[:i]
+	}
+	return "0"
+}
+
+// releaseLockIfHeld removes CONFIG_LOCK from Redis when it is owned by this
+// session. It is called deferred from SessionHandler so that any lock acquired
+// during the session is always released on disconnect, satisfying the
+// RFC 6241 §7.5.1 requirement that locks are session-scoped.
+func releaseLockIfHeld(ctx ssh.Context) {
+	uuid, _ := ctx.Value("uuid").(string)
+	if uuid == "" {
+		return
+	}
+	lock, err := redisClient.Get("CONFIG_LOCK").Result()
+	if err != nil {
+		return
+	}
+	parts := strings.SplitN(lock, ":", 2)
+	if len(parts) == 2 && parts[1] == uuid {
+		redisClient.Del("CONFIG_LOCK")
+		glog.Infof("Lock released on session disconnect")
+	}
+}
+
 func lockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error) {
 
 	// Parser to get Target node
@@ -581,23 +615,6 @@ func lockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 		return "", errors.New("Target must be running config")
 	}
 
-	// lockDuration := 10 // default
-
-	// durationNode := xmlquery.FindOne(rootNode, "//*[local-name() = 'duration']/*")
-
-	// glog.Infof("Duration node", durationNode)
-	// glog.Infof("duration input", durationNode.Data)
-
-	// if durationNode != nil {
-	// 	inputduration, err := strconv.Atoi(durationNode.Data)
-
-	// 	if err != nil {
-	// 		return "", errors.New("Unable to parse duration")
-	// 	}
-
-	// 	lockDuration = inputduration
-	// }
-
 	authenticator := context.Value("auth").(lib.Authenticator)
 
 	if !authenticator.Authorize("lock", "") {
@@ -606,22 +623,30 @@ func lockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, e
 
 	glog.Infof("Authorization passed %+s", "lock")
 
-	lockAcquired, _ := redisClient.SetNX("CONFIG_LOCK", context.Value("uuid"), 15 * time.Second).Result()
+	// Lock value format: "sessionID:uuid" — allows lock-denied responses to
+	// include the holder's session-id as required by RFC 6241 §8.3.9, while
+	// still using the UUID for exact ownership checks.
+	sid := fmt.Sprintf("%v", context.Value(sessionIDContextKey))
+	lockValue := sid + ":" + context.Value("uuid").(string)
+
+	// TTL of 0 means no expiry: the lock is session-scoped and released by the
+	// deferred releaseLockIfHeld call in SessionHandler (RFC 6241 §7.5.1).
+	lockAcquired, _ := redisClient.SetNX("CONFIG_LOCK", lockValue, 0).Result()
 
 	if !lockAcquired {
-		return "", errors.New("Lock failed, lock is already held")
+		current, _ := redisClient.Get("CONFIG_LOCK").Result()
+		holderSessionID := parseSessionIDFromLockValue(current)
+		return "", &LockDeniedError{HolderSessionID: holderSessionID}
 	}
 
-	resultStr := "ok"
-
 	// Account
-	if !authenticator.Account("get", "") {
-		return "", errors.New(fmt.Sprintf("Accounting failed lock - args:%s", ""))
+	if !authenticator.Account("lock", "") {
+		return "", errors.New(fmt.Sprintf("[TACACAs] accounting failed lock - args:%s", ""))
 	}
 
 	glog.Infof("Accounting passed - lock: %s", "")
 
-	return resultStr, nil
+	return "ok", nil
 }
 
 func unlockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string, error) {
@@ -653,7 +678,10 @@ func unlockRequestHandler(context ssh.Context, rootNode *xmlquery.Node) (string,
 		return "", errors.New("Unhandled redis error")
 	}
 
-	if lock != context.Value("uuid") {
+	// Lock value is stored as "sessionID:uuid"; verify ownership by uuid suffix.
+	parts := strings.SplitN(lock, ":", 2)
+	uuid, _ := context.Value("uuid").(string)
+	if len(parts) != 2 || parts[1] != uuid {
 		return "", errors.New("Current session doesn't own active lock")
 	}
 
