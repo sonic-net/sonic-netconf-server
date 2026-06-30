@@ -30,135 +30,118 @@ type RPCRequest struct {
 	payload map[string]interface{}
 }
 
+// RFC6241 6.2.3. A node that contains child elements is a containment node.
+func isContainmentNode(node *xmlquery.Node) bool {
+	return len(xmlquery.Find(node, "./*")) > 0
+}
+
+func getTextOfNode(node *xmlquery.Node) string {
+	ret := ""
+	for _, text := range xmlquery.Find(node, "./text()") {
+		ret += text.Data
+	}
+	return ret
+}
+
+// RFC6241 6.2.4. An empty leaf node is a selection node.
+func isSelectionNode(node *xmlquery.Node) bool {
+	if isContainmentNode(node) {
+		return false
+	}
+	return strings.TrimSpace(getTextOfNode(node)) == ""
+}
+
+// RFC6241 6.2.5. A leaf node with simple content is a content-match node — predicate filter.
+func isContentMatchNode(node *xmlquery.Node) bool {
+	if isContainmentNode(node) {
+		return false
+	}
+	return strings.TrimSpace(getTextOfNode(node)) != ""
+}
+
+func tagName(node *xmlquery.Node) string {
+	if node.Type != xmlquery.ElementNode {
+		return ""
+	} else if node.Prefix == "" {
+		return node.Data
+	} else {
+		return node.Prefix + ":" + node.Data
+	}
+}
+
+func getAttrValue(node *xmlquery.Node, name string) *string {
+	for _, a := range node.Attr {
+		if a.Name.Local == name {
+			v := a.Value
+			return &v
+		}
+	}
+	return nil
+}
+
+func parseContainmentNode(self *xmlquery.Node, pathPrefix string) []string {
+	children := xmlquery.Find(self, "./*")
+	pathPrefix += "/" + tagName(self)
+
+	conditions := []string{}
+	for _, child := range children {
+		if isContentMatchNode(child) {
+			key := tagName(child)
+			value := strings.TrimSpace(getTextOfNode(child))
+			conditions = append(conditions, fmt.Sprintf("%s=%s", key, value))
+		}
+	}
+	if len(conditions) > 0 {
+		pathPrefix += "[" + strings.Join(conditions, " and ") + "]"
+	}
+
+	paths := []string{}
+	for _, child := range children {
+		if isContainmentNode(child) {
+			paths = append(paths, parseContainmentNode(child, pathPrefix)...)
+		}
+	}
+	for _, child := range children {
+		if isSelectionNode(child) {
+			paths = append(paths, pathPrefix+"/"+tagName(child))
+		}
+	}
+	if len(paths) == 0 {
+		paths = append(paths, pathPrefix)
+	}
+	return paths
+}
+
+// ParseGetRequest walks the <filter> subtree and converts it into translib xpaths.
+// The recursive form handles arbitrary depth, content-match-node predicates, and
+// namespace-prefixed element names. The appendAll parameter is retained for caller
+// compatibility but is no longer consulted — the recursive walk emits every path.
 func ParseGetRequest(node *xmlquery.Node, appendAll bool) ([]GetRequest, error) {
-	// TODO: check source tag for config source, for now assume always running config
-	// TODO: request path creation assumes parent -> one child structure in filter tag, validation required
+	_ = appendAll
 
 	glog.Info("Starting parse Get request")
 
-	// Start with filter node
-	filterNode := xmlquery.FindOne(node, "//filter")
-
+	filterNode := xmlquery.FindOne(node, "//*[local-name()='filter']")
 	if filterNode == nil {
 		return []GetRequest{}, errors.New("Need filter element, can't return all configuration for now")
 	}
 
-	queryPaths := []GetRequest{}
-
-	// create base url i.e modelname
-	containers := xmlquery.Find(filterNode, "./*") // get child node
-
-	for _, modelContainer := range containers {
-
-		glog.Infof("Parsing for model %s started", modelContainer.Data)
-
-		// Single request
-		mainPath := "/" + modelContainer.Data + ":" + modelContainer.Data //translib path building
-		glog.Infof("Main path updated %s", mainPath)
-
-		// inner containers
-		innerContainers := xmlquery.Find(modelContainer, "./*")
-
-		if len(innerContainers) == 0 {
-			glog.Info("main container Children are zero, appending")
-			queryPaths = append(queryPaths, GetRequest{path: mainPath, filters: []string{}})
-			continue
-		}
-
-		// Handler inner container
-		for _, innerContainer := range xmlquery.Find(modelContainer, "./*") {
-
-			glog.Infof("Inner container %+v", innerContainer)
-			if innerContainer == nil {
-				queryPaths = append(queryPaths, GetRequest{path: mainPath, filters: []string{}})
-				continue
-			}
-
-			path := mainPath + "/" + innerContainer.Data
-			glog.Infof("Path updated %s", path)
-
-			// Handle each "list" inside innerContainer
-			children := xmlquery.Find(innerContainer, "./*")
-
-			glog.Infof("child len %d", len(children))
-
-			if len(children) == 0 {
-				glog.Info("inner container Children are zero, appending")
-				queryPaths = append(queryPaths, GetRequest{path: path, filters: []string{}})
-				continue
-			}
-
-			for _, child := range children {
-
-				glog.Info("Child parsing started %v", child)
-
-				innerPath := path + "/" + child.Data
-				glog.Infof("Path updated %s", innerPath)
-
-				var keys []string
-
-				if strings.Contains(innerPath, "sonic") {
-					keys = netconf_codegen.SonicMap[innerPath]
-					glog.Infof("Sonic path detected, using sonic keys %v", keys)
-				} else {
-					keys = netconf_codegen.CommonMap[innerPath]
-					glog.Infof("Common path detected, using common keys %v", keys)
-				}
-
-				glog.Infof("Searching for keys and updating path")
-
-				
-				for _, key := range keys {
-					keyNode := xmlquery.FindOne(child, "//*[local-name() = '"+key+"']")
-					
-					if keyNode != nil {
-						glog.Infof("Keynode %s found %+v", key, keyNode)
-
-						dataNode := xmlquery.FindOne(child, "//*[local-name() = '"+key+"']/text()")
-
-						if dataNode != nil {
-							innerPath += "[" + key + "=" + fmt.Sprintf("%v", strings.TrimSpace(dataNode.Data)) + "]"
-							glog.Infof("Path updated %s", innerPath)
-						}
-
-						// else{
-						// 	glog.Infof("Key [%s] data is empty, should be used as list filter", key)
-						// 	listFilters = append(listFilters, key)
-						// }
-					}
-				}
-
-
-				listFilters := []string{}
-
-				leafs := xmlquery.Find(child, "./*")
-
-				for _, leaf := range leafs {
-					dataNode := xmlquery.FindOne(child, "//*[local-name() = '"+leaf.Data+"']/text()")
-					if dataNode == nil {
-						glog.Infof("Empty leaf, should be used as list filter", leaf.Data)
-						listFilters = append(listFilters, leaf.Data)
-					}
-				}
-
-				glog.Infof("Filters for list %+s %+v", child.Data, listFilters)
-
-				// if keysFound == 0 {
-				// 	glog.Infof("List level request without any keys, returning entire list")
-				// }
-
-				queryPaths = append(queryPaths, GetRequest{path: innerPath, filters: listFilters})
-			}
-
-			glog.Infof("Parsing for model %s ended", modelContainer.Data)
-		}
-
+	if debugXPath := getAttrValue(filterNode, "debugxpath"); debugXPath != nil {
+		return []GetRequest{{path: *debugXPath, filters: []string{}}}, nil
 	}
 
-	glog.Infof("Paths found in get request", queryPaths)
+	queryPaths := []GetRequest{}
+	for _, modelContainer := range xmlquery.Find(filterNode, "./*") {
+		glog.V(0).Infof("Parsing for model %s started", tagName(modelContainer))
+		for _, path := range parseContainmentNode(modelContainer, "") {
+			queryPaths = append(queryPaths, GetRequest{path: path, filters: []string{}})
+		}
+		glog.V(0).Infof("Parsing for model %s ended", modelContainer.Data)
+	}
 
+	glog.Infof("Paths found in get request %+v", queryPaths)
 	return queryPaths, nil
-} 
+}
 
 func ParseGetSchemaRequest(node *xmlquery.Node) (GetSchema, error) {
 	identifier := xmlquery.FindOne(node, "//identifier/text()")

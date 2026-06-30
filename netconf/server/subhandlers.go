@@ -215,6 +215,21 @@ func innerGetHandler(rootNode *xmlquery.Node, request GetRequest, target DbTarge
 			namespace := YangSchemas[s2[1]][0].NameSpace
 			resultStr = strings.Replace(resultStr, s2[1], s2[1]+" xmlns=\""+namespace+"\"", 1)
 
+			glog.V(0).Infof("[[DEBUG]] Begin inserting xmlns resultStr = %s", resultStr)
+				r3 := regexp.MustCompile("<([\\w-]+?):([\\w-]+?)(/?)>")
+				s3 := r3.FindAllStringSubmatch(resultStr, -1)
+				for _, s := range s3 {
+					prefix := s[1]
+					name := s[2]
+					slash := s[3]
+					fmt.Printf("[[DEBUG]] Looking for namespace for prefix = %s\n", prefix)
+					ns := getNamespace(prefix)
+					fmt.Printf("[[DEBUG]] namespace for prefix = %s is %s\n", prefix, ns)
+					resultStr = strings.ReplaceAll(resultStr, s[0], fmt.Sprintf("<%s:%s xmlns:%s=\"%s\"%s>", prefix, name, prefix, ns, slash))
+				}
+
+			glog.V(0).Infof("[[DEBUG]] End inserting xmlns resultStr = %s", resultStr)
+
 			return resultStr, nil
 		}
 	}
@@ -222,9 +237,20 @@ func innerGetHandler(rootNode *xmlquery.Node, request GetRequest, target DbTarge
 	return "", nil
 }
 
+func getNamespace(prefix string) string {
+	s, ok := YangSchemas[prefix]
+	if !ok {
+		return ""
+	}
+	if len(s) == 0 {
+		return ""
+	}
+	return s[0].NameSpace
+}
+
 func postChecks(rootNode *xmlquery.Node, jsonConv mxj.Map) mxj.Map {
 
-	filterNode := xmlquery.FindOne(rootNode, "//filter")
+	filterNode := xmlquery.FindOne(rootNode, "//*[local-name()='filter']")
 	containers := xmlquery.Find(filterNode, "./*")
 
 	for _, modelContainer := range containers {
